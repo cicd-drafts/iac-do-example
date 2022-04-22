@@ -1,6 +1,6 @@
 locals {
-  name         = "iac-template"
+  name         = "iac-do-example"
   alias        = "iac"
-  repository   = "iac-template"
-  organization = "RustamGimadiev"
+  repository   = "iac-do-example"
+  organization = "cicd-drafts"
 }
