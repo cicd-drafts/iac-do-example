@@ -1,4 +1,4 @@
-name: Terragrunt states
+name: Terragrunt
 
 on:
   push:
@@ -6,81 +6,19 @@ on:
       - main
     paths:
       - states/**
-
   workflow_dispatch:
-    inputs:
-      dir_to_apply:
-        description: >
-          The directory of the resource grouping to apply,
-          for example, to apply changes in "main/us-west-2/development/app" directory resource grouping,
-          value should be "main/us-west-2/development/app".
-          To minimize blast radius, this only supports one resource grouping at a time.
-        required: true
-        default: ''
-      terragrunt_action:
-        description: >
-          The action for Terragrunt to run, options are "apply", "plan". Defaults to "plan", if not specified.
-        required: true
-        default: 'plan'
+
 jobs:
-  get-changed-states:
-    name: Get modified states
-    outputs:
-      matrix: ${{ steps.filter.outputs.matrix }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 2
-
-      - name: Get changed files
-        id: changed-files
-        uses: tj-actions/changed-files@v14.1
-        with:
-          files: states/**
-
-      - id: filter
-        name: Filter
-        run: |
-          export states="{}"
-          export items="[]"
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]
-            then
-              states='{"states": ["states/'${{ github.event.inputs.dir_to_apply }}'"]}'
-          else
-            for dir in `echo ${{ steps.changed-files.outputs.all_changed_and_modified_files }} | tr ' ' '\n' | grep '(*.hcl$\|.yaml$\|.yml$)' | xargs -I {} dirname {} | sort | uniq`
-            do
-              if [[ -f $dir/terragrunt.hcl ]] && [[ "$dir" != "states" ]]
-                then
-                  items=$(echo $items | jq -c --arg obj $dir '. += [$obj]')
-              fi
-            done
-            states=$(echo {} | jq -c -s --argjson obj $items '{states: $obj}')
-          fi
-          echo Filtered directoies: $states
-          echo "::set-output name=matrix::$(echo "${states}")"
-
-  terragrunt-apply:
-    name: "Terragrunt Apply"
+  apply:
+    name: "Terragrunt"
     permissions:
       id-token: write
       contents: read
       pull-requests: write
     runs-on: ubuntu-latest
-    if: "${{ needs.get-changed-states.outputs.matrix != '{\"states\": []}' && ( github.event_name == 'push' || github.event.inputs.terragrunt_action == 'apply') }}"
-    needs: get-changed-states
     steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
       - name: Checkout
         uses: actions/checkout@v2
-        with:
-          token: ${{ secrets.IAC_PAT }}
 
       - name: Setup Terragrunt
         uses: autero1/action-terragrunt@v1.1.1
@@ -95,165 +33,12 @@ jobs:
       - name: Terragrunt Apply
         id: tg_apply
         env:
-          SOPS_KMS_ARN: ${{ secrets.SOPS_KMS_ARN }}
+          AWS_DEFAULT_REGION: "eu-central-1"
+          AWS_ACCESS_KEY_ID: ${{ secrets.DO_SPACE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.DO_SPACE_SECRET_ACCESS_KEY }}
+          DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+          TF_VAR_do_token: ${{ secrets.DIGITALOCEAN_TOKEN }}
         run: |
           set -x
-          # need to define deepest common subfolder in all states
-          RESULT=""
-          states=`echo '${{ needs.get-changed-states.outputs.matrix }}' | jq -r .states[] | tr '\n' ' '`
-          eval "STATES=($states)"
-          for part in `echo $STATES | cut -d' ' -f1 | tr '/' ' '`
-            do
-              RES=""
-              for s in "${STATES[@]}"; do
-                [[ $s =~ $part ]] || RES=NOT_FOUND
-                [[ $RES == NOT_FOUND ]] && break
-                RES=$part
-              done
-              [[ $RES == NOT_FOUND ]] || RESULT="$RESULT/$RES"
-          done
-          TG_WORKING_DIR=$(echo $RESULT | sed 's/^\///')
-          echo "Terragrunt will be applyed from $TG_WORKING_DIR folder"
-          cd $TG_WORKING_DIR
-          DIRECTORIES=""
-          for dir in $(echo '${{ needs.get-changed-states.outputs.matrix }}' | jq -r .states[] | sed "s|$TG_WORKING_DIR||")
-            do
-              DIRECTORIES="$DIRECTORIES --terragrunt-include-dir=$dir"
-          done
-          terragrunt run-all apply $DIRECTORIES --terragrunt-non-interactive
-          terragrunt run-all state pull $DIRECTORIES --terragrunt-non-interactive > $GITHUB_WORKSPACE/terraform.tfstate
-
-      - name: Get generated local files
-        id: generated_files
-        if: steps.tg_apply.outcome == 'success'
-        run: |
-          generated_files=$(jq -r '.resources[] | select(.type=="local_file") | .instances[].attributes.filename' $GITHUB_WORKSPACE/terraform.tfstate | sed 's|\./||' | tr '\n' ' ')
-          echo "::set-output name=generated_files::$generated_files"
-
-      - name: Add local files back to repository
-        if: steps.generated_files.outputs.generated_files != ''
-        run: |
-          export REPO_NAME=${GITHUB_REPOSITORY/$GITHUB_REPOSITORY_OWNER\//}
-          for file in ${{ steps.generated_files.outputs.generated_files }}
-            do
-              full_path=$(find states -path "*/$file")
-              prefix=$(echo $full_path | grep -oP 'states/\K([^.]*)')
-              file_dir=$(dirname $file | sed 's/^\.//')
-              mkdir -p /home/runner/work/$REPO_NAME/$REPO_NAME/generated/$prefix$file_dir
-              cp -rf $full_path /home/runner/work/$REPO_NAME/$REPO_NAME/generated/$prefix$file_dir
-          done
-
-      - name: Commit local files back to repository
-        if: steps.generated_files.outputs.generated_files != ''
-        uses: stefanzweifel/git-auto-commit-action@v4
-        with:
-          commit_message: Applying generated files back to repository
-          file_pattern: "generated/**"
-          push_options: --force
-
-  terragrunt-plan:
-    name: "Terragrunt Plan"
-    permissions:
-      id-token: write
-      contents: read
-      pull-requests: write
-    runs-on: ubuntu-latest
-    if: "${{ needs.get-changed-states.outputs.matrix != '{\"states\": []}' && ( github.event_name == 'pull_request' || github.event.inputs.terragrunt_action == 'plan' ) }}"
-    needs: get-changed-states
-    strategy:
-      matrix: ${{ fromJson(needs.get-changed-states.outputs.matrix) }}
-    defaults:
-      run:
-        working-directory: ${{ matrix.states }}
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          token: ${{ secrets.IAC_PAT }}
-
-      - name: Setup Terragrunt
-        uses: autero1/action-terragrunt@v1.1.1
-        with:
-          terragrunt_version: 0.36.0
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v1
-        with:
-          terraform_wrapper: false
-
-      - name: Terragrunt Init
-        id: init
-        run: terragrunt init
-
-      - name: Terragrunt fmt
-        id: tg_fmt
-        run: terragrunt fmt -check
-        continue-on-error: true
-
-      - name: Terragrunt Plan
-        id: tg_plan
-        run: |
-          terragrunt plan -no-color -input=false --terragrunt-source-update > report.txt || status=$?
-          REPORT=$(cat report.txt)
-          REPORT="${REPORT//'%'/'%25'}"
-          REPORT="${REPORT//$'\n'/'%0A'}"
-          REPORT="${REPORT//$'\r'/'%0D'}"
-          echo "::set-output name=report::$REPORT"
-          exit $status
-        continue-on-error: true
-
-      - name: Setup Infracost
-        if: ${{ github.event_name == 'pull_request' }}
-        uses: infracost/actions/setup@v1
-        with:
-          api-key: ${{ secrets.INFRACOST_API_KEY }}
-
-      - name: Generate Infracost comment
-        if: ${{ github.event_name == 'pull_request' }}
-        id: cost_comment
-        run: |
-          infracost breakdown --path . --format json --out-file infracost.json
-          REPORT=$(infracost output --path infracost.json --format github-comment --show-skipped)
-          REPORT="${REPORT//'%'/'%25'}"
-          REPORT="${REPORT//$'\n'/'%0A'}"
-          REPORT="${REPORT//$'\r'/'%0D'}"
-          echo "::set-output name=report::$REPORT"
-
-      - name: Find Comment
-        uses: peter-evans/find-comment@v1
-        id: fc
-        if: ${{ github.event_name == 'pull_request' }}
-        with:
-          issue-number: ${{ github.event.pull_request.number }}
-          comment-author: 'github-actions[bot]'
-          body-includes: "Report for state ${{ matrix.states }}:"
-
-      - name: Create or update comment
-        uses: peter-evans/create-or-update-comment@v1
-        if: ${{ github.event_name == 'pull_request' }}
-        with:
-          comment-id: ${{ steps.fc.outputs.comment-id }}
-          issue-number: ${{ github.event.pull_request.number }}
-          body: |
-            ### Report for state ${{ matrix.states }}:
-            #### Format and Style 🖌 `${{ steps.tg_fmt.outcome }}`
-            #### Plan 📖 `${{ steps.tg_plan.outcome }}`
-            <details><summary>Show plan details</summary>
-
-            ```
-            ${{ steps.tg_plan.outputs.report }}
-            ```
-
-            </details>
-            ${{ steps.cost_comment.outputs.report }}
-          edit-mode: replace
-
-      - name: Status
-        if: ${{ github.event_name == 'pull_request' && steps.tg_plan.outcome == 'failure' }}
-        run: exit 1
+          cd states/eu-central-1/production/
+          terragrunt run-all apply --terragrunt-non-interactive

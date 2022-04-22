@@ -9,7 +9,7 @@ include {
 }
 
 terraform {
-  source = "${dirname(find_in_parent_folders())}/../modules/kubernetes"
+  source = "${dirname(find_in_parent_folders())}/../modules/do-k8s-cluster"
 }
 
 inputs = {
